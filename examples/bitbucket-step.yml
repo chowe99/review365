@@ -1,0 +1,28 @@
+          - step:
+              name: AI Code Review (review365)
+              image: node:24-alpine
+              script:
+                - |
+                  # review365 by Sam Wyndham (Biz365, https://biz365.com.au, https://github.com/mrwyndham).
+                  # The review itself is review365.sh in https://git.howse.top/cod/review365, fetched at the
+                  # moving tag v1. This step only sets this repo's focus. Advisory: never blocks a merge; the
+                  # "review365" commit status is FAILED when the review itself couldn't run.
+                  # Repository variables (Secured): CLAUDE_CODE_OAUTH_TOKEN, BB_REVIEW_TOKEN.
+                  # Optional: REVIEW365_MODEL, REVIEW365_VERIFY_MODEL, REVIEW365_SRC (raw URL to test a change).
+                  export CLAUDE_CODE_SKIP_PROMPT_HISTORY=1
+                  export REVIEW365_FOCUS="Expo React Native app + Next.js API on Vercel: Clerk auth, Stripe payments and message credits, Twilio SMS and email sending, Neon Postgres, anonymous messaging"
+                  export REVIEW365_EXTRA_RULES="- Rate limits here are the anti-harassment control, not DoS hardening: a send path (payment,
+                    credit or free-note) that skips, weakens or can bypass the IP/user/recipient daily/recipient
+                    lifetime limits, the unsubscribe check or the recipient opt-out IS a finding (HIGH or above).
+                  - Anonymity is the product: anything that can reveal a sender's identity (email, phone, user id,
+                    IP, payment details) to a recipient, in a message, header, link, log visible to them or API
+                    response, is CRITICAL.
+                  - Pay-then-send: a message sent without a verified, unused payment or credit, or a payment or
+                    credit consumed twice or refunded without reversing the send, is CRITICAL.
+                  - Compliance logging (2-year retention of sends) skipped or lossy on any send path is HIGH."
+                  # Default noise filter minus rate limiting, which matters here.
+                  export REVIEW365_NOISE='denial.of.service|\bdos\b|redos|catastrophic backtracking|consider adding|best practice|could potentially|might potentially'
+                  apk add --no-cache curl >/dev/null
+                  curl -fsSL --retry 3 --retry-all-errors -o /tmp/review365.sh \
+                    "${REVIEW365_SRC:-https://git.howse.top/cod/review365/raw/tag/v1/review365.sh}"
+                  sh /tmp/review365.sh

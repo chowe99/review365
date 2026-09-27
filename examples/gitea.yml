@@ -1,0 +1,41 @@
+name: review365 — AI Code Review
+
+# review365 by Sam Wyndham (Biz365, https://biz365.com.au, https://github.com/mrwyndham).
+# The review itself is review365.sh in https://git.howse.top/cod/review365, fetched at the
+# moving tag v1. This stub only says when to run and what this repo is: change review365
+# there, not here. Secret: CLAUDE_CODE_OAUTH_TOKEN. Open PRs from a pushed branch, because
+# Gitea gives AGit (refs/for/…) PRs no secrets. Set the REVIEW365_SRC variable to a raw URL
+# (e.g. a branch) to try a review365 change on this repo first.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+env:
+  REVIEW365_FOCUS: "Next.js API, Postgres, Stripe"   # one line: what this repo is
+  # Optional: REVIEW365_CLASSES / REVIEW365_EXTRA_RULES (multi-line, `: |`), REVIEW365_NOISE
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    container: node:24-alpine
+    steps:
+      - name: AI Code Review
+        env:
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          API_TOKEN: ${{ secrets.REVIEW365_TOKEN || github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          BASE: ${{ github.event.pull_request.base.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          REPO_URL: ${{ github.event.repository.html_url }}
+          REVIEW365_MODEL: ${{ vars.REVIEW365_MODEL }}
+          REVIEW365_VERIFY_MODEL: ${{ vars.REVIEW365_VERIFY_MODEL }}
+          REVIEW365_SRC: ${{ vars.REVIEW365_SRC }}
+          CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1"
+        shell: sh
+        run: |
+          # In-cluster URL: the job container can't always resolve git.howse.top.
+          apk add --no-cache curl >/dev/null
+          curl -fsSL --retry 3 --retry-all-errors -o /tmp/review365.sh \
+            "${REVIEW365_SRC:-${GITHUB_SERVER_URL}/cod/review365/raw/tag/v1/review365.sh}"
+          sh /tmp/review365.sh
