@@ -13,6 +13,11 @@
 #              PR/BASE/HEAD_SHA come from BITBUCKET_* automatically
 #   Optional:  REVIEW365_FOCUS, REVIEW365_CLASSES, REVIEW365_EXTRA_RULES, REVIEW365_NOISE,
 #              REVIEW365_MODEL (default sonnet), REVIEW365_VERIFY_MODEL (default opus)
+#   Push mode (opt-in, Gitea only): REVIEW365_MODE=push reviews BEFORE..AFTER of a push and
+#              opens one issue per push with findings. Needs BEFORE, AFTER, API_TOKEN, REPO_URL;
+#              optional REVIEW365_NTFY_URL (+ REVIEW365_NTFY_TOKEN). Any other REVIEW365_MODE
+#              value, or none, is PR mode.
+#   REVIEW365_DRY_RUN=1: print what would be posted instead of calling any API (both modes).
 set -u
 GITLEAKS_VERSION="${GITLEAKS_VERSION:-8.30.1}"
 GITLEAKS_SHA256="${GITLEAKS_SHA256:-551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb}"
@@ -23,8 +28,13 @@ if [ -n "${BITBUCKET_BUILD_NUMBER:-}" ]; then
 else
   ON_BB=""
 fi
+# Both are off unless set to exactly these values, so an unset or other value changes nothing.
+PUSH_MODE=""; [ "${REVIEW365_MODE:-}" = push ] && PUSH_MODE=1
+DRY_RUN=""; [ "${REVIEW365_DRY_RUN:-}" = 1 ] && DRY_RUN=1
+[ -n "$PUSH_MODE" ] && [ -n "$ON_BB" ] && { echo "[review365] REVIEW365_MODE=push is Gitea-only"; exit 1; }
 apk add --no-cache git curl bash jq >/dev/null
-[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || { echo "[review365] CLAUDE_CODE_OAUTH_TOKEN secret is not set (Gitea AGit PRs get no secrets)"; exit 1; }
+# A dry run may use a claude that is already logged in, so it doesn't need the token.
+[ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || [ -n "$DRY_RUN" ] || { echo "[review365] CLAUDE_CODE_OAUTH_TOKEN secret is not set (Gitea AGit PRs get no secrets)"; exit 1; }
 
 if [ -n "$ON_BB" ]; then
   # Bitbucket has already cloned the PR's source branch (shallow). Fetch the destination
@@ -34,6 +44,52 @@ if [ -n "$ON_BB" ]; then
     || { echo "[review365] fetch of ${BASE} failed"; exit 0; }
   git fetch -q --no-tags --deepen=200 origin 2>/dev/null || true
   git update-ref refs/pr HEAD
+elif [ -n "$PUSH_MODE" ]; then
+  # Push mode: review BEFORE..AFTER. AFTER is fetched by SHA (Gitea serves any commit over
+  # protocol v2), so a later push can't change what is reviewed; it becomes refs/pr, which is
+  # what the review core reads files from.
+  { [ -n "${BEFORE:-}" ] && [ -n "${AFTER:-}" ]; } || { echo "[review365] push mode needs BEFORE and AFTER"; exit 1; }
+  echo "$BEFORE" | grep -qE '^0+$' && { echo "[review365] push: new branch (BEFORE is all zeros), nothing to diff against. Skipping."; exit 0; }
+  echo "$AFTER" | grep -qE '^0+$' && { echo "[review365] push: branch deleted. Skipping."; exit 0; }
+  HOST="${GITHUB_SERVER_URL#*://}"
+  git init -q repo && cd repo || exit 1
+  git remote add origin "${GITHUB_SERVER_URL%%://*}://x-access-token:${API_TOKEN}@${HOST}/${GITHUB_REPOSITORY}.git"
+  git fetch -q --no-tags --depth=200 origin "+${AFTER}:refs/pr" \
+    || { echo "[review365] fetch of AFTER ${AFTER} failed (token or SHA)"; exit 1; }
+  # BEFORE is normally inside those 200 commits. Fetch it on its own when it isn't (a push of
+  # more than 200 commits, or a force-push where BEFORE is no longer an ancestor).
+  git cat-file -e "${BEFORE}^{commit}" 2>/dev/null \
+    || git fetch -q --no-tags --depth=1 origin "$BEFORE" \
+    || { echo "[review365] fetch of BEFORE ${BEFORE} failed"; exit 1; }
+  BEFORE=$(git rev-parse "${BEFORE}^{commit}") && AFTER=$(git rev-parse refs/pr) || exit 1
+  # Merge of an already-reviewed PR (heuristic): Gitea's merge button pushes one merge commit
+  # whose first parent is the old tip (BEFORE) and whose subject is Gitea's default
+  # "Merge pull request '<title>' (#N) from <branch> into <base>". Its changes were reviewed
+  # on the PR. Squash and rebase merges, and merges with a custom message template, don't
+  # match and are reviewed again.
+  if git rev-parse -q --verify "refs/pr^2" >/dev/null \
+      && [ "$(git rev-parse "refs/pr^1")" = "$BEFORE" ] \
+      && git log -1 --format=%s refs/pr | grep -qE "^Merge pull request '.*' \(#[0-9]+\) from "; then
+    echo "[review365] push: merge commit of an already-reviewed PR ($(git log -1 --format=%s refs/pr | cut -c1-120)). Skipping."
+    exit 0
+  fi
+  # Lockfile-only pushes (flake.lock bumps and the like): nothing to review.
+  LOCKFILES='(^|/)(flake\.lock|pnpm-lock\.yaml|package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|bun\.lockb?|Cargo\.lock|go\.sum|poetry\.lock|uv\.lock|Pipfile\.lock|Gemfile\.lock|composer\.lock|mix\.lock|pubspec\.lock|Podfile\.lock|packages\.lock\.json)$'
+  PUSH_FILES=$(git diff --name-only "$BEFORE" refs/pr)
+  if [ -n "$PUSH_FILES" ] && ! echo "$PUSH_FILES" | grep -qvE "$LOCKFILES"; then
+    echo "[review365] push: only lockfiles changed ($(echo "$PUSH_FILES" | tr '\n' ' ')). Skipping."
+    exit 0
+  fi
+  SHORT_BEFORE=$(printf '%.7s' "$BEFORE"); SHORT_AFTER=$(printf '%.7s' "$AFTER")
+  DIFF_RANGE="${BEFORE}..refs/pr"; LOG_RANGE="${BEFORE}..refs/pr"; CONTEXT_REF="$BEFORE"
+  # gitleaks reads a shallow boundary commit as adding its whole tree, which floods the report
+  # with old secrets when BEFORE was outside the 200 commits. Exclude the boundaries: a push of
+  # more than 200 commits gets its newest 200 scanned. (Single spaces: gitleaks splits on them.)
+  SHALLOW="$(git rev-parse --git-dir)/shallow"
+  [ -f "$SHALLOW" ] && while IFS= read -r c; do LOG_RANGE="${LOG_RANGE} ^${c}"; done < "$SHALLOW"
+  TARGET="push ${SHORT_BEFORE}..${SHORT_AFTER} (${GITHUB_REF_NAME:-branch})"
+  # BASE is only a label from here on ("PROJECT CONTEXT (from …)"): docs come from BEFORE.
+  BASE="${GITHUB_REF_NAME:-branch}@${SHORT_BEFORE}"; HEAD_SHA="$AFTER"; PR=""; LEAKS=""
 else
   # Fetch just the two refs we diff (private repo: auth with the run token).
   HOST="${GITHUB_SERVER_URL#*://}"
@@ -42,10 +98,15 @@ else
   git fetch -q --no-tags --depth=200 origin "+refs/heads/${BASE}:refs/remotes/origin/${BASE}" "+refs/pull/${PR}/head:refs/pr" \
     || { echo "[review365] fetch failed (token or ref)"; exit 1; }
 fi
+# PR mode's ranges, spelled exactly as before; push mode set its own above.
+if [ -z "$PUSH_MODE" ]; then
+  DIFF_RANGE="origin/${BASE}...refs/pr"; LOG_RANGE="origin/${BASE}..refs/pr"; CONTEXT_REF="origin/${BASE}"
+  TARGET="PR #${PR} → ${BASE}"
+fi
 
 # Lockfiles, SVGs, minified JS, source maps and Unreal binary assets (LFS pointers): nothing to review
 DIFF_FILE=$(mktemp)
-if ! git diff "origin/${BASE}...refs/pr" -- . \
+if ! git diff "$DIFF_RANGE" -- . \
     ':(exclude,glob)**/pnpm-lock.yaml' ':(exclude,glob)**/package-lock.json' \
     ':(exclude,glob)**/yarn.lock' ':(exclude,glob)**/flake.lock' ':(exclude,glob)**/*.svg' \
     ':(exclude,glob)**/*.min.js' ':(exclude,glob)**/*.map' \
@@ -54,7 +115,7 @@ if ! git diff "origin/${BASE}...refs/pr" -- . \
   exit 0
 fi
 DIFF_SIZE=$(wc -c < "$DIFF_FILE")
-echo "[review365] PR #${PR} → ${BASE}, diff ${DIFF_SIZE} bytes"
+echo "[review365] ${TARGET}, diff ${DIFF_SIZE} bytes"
 [ "$DIFF_SIZE" -eq 0 ] && { echo "[review365] No diff. Skipping."; exit 0; }
 
 list_files() { grep -E '^diff --git ' "$1" | sed -E 's|^diff --git a/(.*) b/.*$|\1|' | sort -u; }
@@ -74,7 +135,7 @@ fi
 CHANGED_FILES=$(list_files "$DIFF_FILE")
 # Binary assets are excluded from the diff, but their names still tell the model when a
 # C++ rename/removal has (or hasn't) got matching asset changes / CoreRedirects.
-BINARY_ASSETS=$(git diff --name-status "origin/${BASE}...refs/pr" -- '*.uasset' '*.umap' | head -200)
+BINARY_ASSETS=$(git diff --name-status "$DIFF_RANGE" -- '*.uasset' '*.umap' | head -200)
 echo "[review365] Files in diff:"; echo "$CHANGED_FILES" | sed 's/^/  - /'
 DROPPED_FILES=$(echo "$ALL_FILES" | grep -vxF "$CHANGED_FILES" || true)
 [ -n "$DROPPED_FILES" ] && { echo "[review365] WARN: NOT reviewed (past the ${MAX_DIFF_BYTES}-byte cap):"; echo "$DROPPED_FILES" | sed 's/^/  - /'; }
@@ -83,7 +144,7 @@ DROPPED_FILES=$(echo "$ALL_FILES" | grep -vxF "$CHANGED_FILES" || true)
 # the reviewer's instructions. 50KB each keeps a runaway README from dominating.
 CONTEXT=""
 for f in CLAUDE.md AGENTS.md README.md; do
-  body=$(git show "origin/${BASE}:${f}" 2>/dev/null | head -c 50000) || continue
+  body=$(git show "${CONTEXT_REF}:${f}" 2>/dev/null | head -c 50000) || continue
   [ -n "$body" ] && CONTEXT="${CONTEXT}
 ===== ${f} =====
 ${body}
@@ -215,7 +276,11 @@ PROMPT_FILE=$(mktemp)
   echo "DIFF:"; cat "$DIFF_FILE"
 } > "$PROMPT_FILE"
 
+if [ -n "$DRY_RUN" ] && command -v claude >/dev/null 2>&1; then
+  echo "[review365] dry run: using the installed $(command -v claude)"
+else
 curl -fsSL --retry 3 --retry-all-errors https://claude.ai/install.sh | bash >/dev/null
+fi
 export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 
 # Run from a clean dir so the repo's .claude/ config isn't auto-loaded; the docs
@@ -347,7 +412,7 @@ GL=$(mktemp -d)
 if curl -fsSL --retry 3 --retry-all-errors -o "$GL/gl.tgz" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
     && echo "${GITLEAKS_SHA256}  $GL/gl.tgz" | sha256sum -c - >/dev/null \
     && tar -xzf "$GL/gl.tgz" -C "$GL" gitleaks; then
-  "$GL/gitleaks" git --no-banner --no-color --redact --exit-code 0 --log-opts="origin/${BASE}..refs/pr" \
+  "$GL/gitleaks" git --no-banner --no-color --redact --exit-code 0 --log-opts="$LOG_RANGE" \
     --report-format json --report-path "$GL/report.json" . 2>&1 | tail -2 | sed 's/^/  [gitleaks] /'
   LEAKS=$(jq '[.[] | {file:.File, line:.StartLine, severity:"CRITICAL", confidence:1,
     message:"Possible secret (\(.RuleID)) committed in \(.Commit[0:8]). Rotate it: it stays in git history even if this line is removed."}]' "$GL/report.json" 2>/dev/null || echo '[]')
@@ -358,11 +423,78 @@ else
   echo "[review365] WARN: gitleaks download/verify failed; secret scan skipped"
 fi
 
-if [ -n "$ON_BB" ]; then
+if [ -n "$PUSH_MODE" ]; then
+# Push mode: Gitea has no commit-comment API, so one issue per push that has findings.
+API="${GITHUB_API_URL:-${GITHUB_SERVER_URL}/api/v1}/repos/${GITHUB_REPOSITORY}"
+N=$(echo "$FINDINGS" | jq length)
+COMMIT_URL="${REPO_URL}/src/commit/${AFTER}"
+echo "$FINDINGS" | jq -r --arg u "$COMMIT_URL" '.[] | "[review365] \(.severity) \($u)/\(.file)#L\(.line)"'
+if [ "$N" -eq 0 ]; then
+  echo "[review365] push: no findings, no issue"
+else
+  TITLE="review365: ${SHORT_AFTER} — ${N} finding(s)"
+  if [ -z "$LEAKS" ]; then
+    GL_NOTE="gitleaks did not run (download/verify failed): this push was NOT scanned for secrets."
+  elif [ "$(echo "$LEAKS" | jq length)" -eq 0 ]; then
+    GL_NOTE="gitleaks scanned the commits in ${SHORT_BEFORE}..${SHORT_AFTER}: no secrets found."
+  else
+    GL_NOTE="gitleaks scanned the commits in ${SHORT_BEFORE}..${SHORT_AFTER}: $(echo "$LEAKS" | jq length) possible secret(s), listed above as CRITICAL \"Possible secret\" findings."
+  fi
+  BODY=$(echo "$FINDINGS" | jq -r --arg u "$COMMIT_URL" '.[]
+    | (if .severity == "CRITICAL" or .severity == "HIGH" then "🔴" else "🟡" end) as $e
+    | "- \($e) **\(.severity)** [`\(.file):\(.line)`](\($u)/\(.file)#L\(.line)): \(.message)"
+      + (if .entry_point then "\n  **Trigger:** \(.entry_point)" else "" end)
+      + (if .impact then "\n  **Impact:** \(.impact)" else "" end)')
+  BODY="Push [\`${SHORT_BEFORE}..${SHORT_AFTER}\`](${REPO_URL}/compare/${BEFORE}...${AFTER}) to \`${GITHUB_REF_NAME:-branch}\`.
+
+## Findings
+
+${BODY}
+
+## gitleaks
+
+${GL_NOTE}"
+  [ -n "$REVIEW_ERR" ] && BODY="${BODY}
+
+**The model review did not complete (${REVIEW_ERR}); only the gitleaks results above are from this push.**"
+  BODY="${BODY}
+
+_Posted by [review365](https://biz365.com.au)_"
+  PL=$(jq -n --arg t "$TITLE" --arg b "$BODY" '{title:$t,body:$b}')
+  ISSUE_URL="$COMMIT_URL"; POST_FAILED=""
+  if [ -n "$DRY_RUN" ]; then
+    echo "[review365] DRY RUN: would POST ${API}/issues"
+    echo "  title: ${TITLE}"; printf '%s\n' "$BODY" | sed 's/^/  | /'
+  else
+    RESP=$(mktemp)
+    H=$(curl -s -o "$RESP" -w "%{http_code}" -X POST -H "Authorization: token ${API_TOKEN}" \
+      -H "Content-Type: application/json" -d "$PL" "${API}/issues")
+    if [ "$H" = 201 ]; then
+      ISSUE_URL=$(jq -r '.html_url // empty' "$RESP"); echo "[review365] ✓ issue ${ISSUE_URL}"
+    else
+      echo "[review365] could not create the issue (HTTP $H; the token needs issue write):"; head -c 300 "$RESP"; echo ""
+      POST_FAILED=1
+    fi
+  fi
+  if [ -n "${REVIEW365_NTFY_URL:-}" ]; then
+    MSG="review365: ${GITHUB_REPOSITORY} ${SHORT_AFTER} — ${N} finding(s): ${ISSUE_URL}"
+    if [ -n "$DRY_RUN" ]; then
+      echo "[review365] DRY RUN: would POST to ntfy ${REVIEW365_NTFY_URL}: ${MSG}"
+    elif [ -n "${REVIEW365_NTFY_TOKEN:-}" ]; then
+      curl -s -o /dev/null -H "Authorization: Bearer ${REVIEW365_NTFY_TOKEN}" -H "Title: review365" -d "$MSG" "$REVIEW365_NTFY_URL" || echo "[review365] WARN: ntfy post failed"
+    else
+      curl -s -o /dev/null -H "Title: review365" -d "$MSG" "$REVIEW365_NTFY_URL" || echo "[review365] WARN: ntfy post failed"
+    fi
+  fi
+  # Findings don't fail the job, but findings nobody will see do.
+  [ -n "$POST_FAILED" ] && exit 1
+fi
+elif [ -n "$ON_BB" ]; then
 # One inline comment per finding, so a line Bitbucket rejects doesn't sink the rest.
 BB_API="https://api.bitbucket.org/2.0/repositories/${BITBUCKET_WORKSPACE}/${BITBUCKET_REPO_SLUG}"
 BB_REVIEW_TOKEN=$(printf '%s' "${BB_REVIEW_TOKEN:-}" | tr -d '\n\r ')
 [ -n "$BB_REVIEW_TOKEN" ] || echo "[review365] WARN: BB_REVIEW_TOKEN unset; printing findings only"
+[ -n "$DRY_RUN" ] && echo "[review365] DRY RUN: printing findings instead of posting them"
 echo "$FINDINGS" | jq -c '.[]' | while IFS= read -r f; do
   SEV=$(echo "$f" | jq -r .severity)
   case "$SEV" in CRITICAL|HIGH) E="🔴";P="";; *) E="🟡";P="[advisory] ";; esac
@@ -372,7 +504,7 @@ echo "$FINDINGS" | jq -c '.[]' | while IFS= read -r f; do
       + (if .impact then "\n**Impact:** "+.impact else "" end)
       + "\n\n_Posted by [review365](https://biz365.com.au)_")},inline:{to:.line,path:.file}}')
   URL="https://bitbucket.org/${BITBUCKET_WORKSPACE}/${BITBUCKET_REPO_SLUG}/src/${HEAD_SHA}/$(echo "$f" | jq -r '"\(.file)#lines-\(.line)"')"
-  if [ -n "$BB_REVIEW_TOKEN" ]; then
+  if [ -n "$BB_REVIEW_TOKEN" ] && [ -z "$DRY_RUN" ]; then
     H=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: Bearer ${BB_REVIEW_TOKEN}" \
       -H "Content-Type: application/json" -d "$PL" "${BB_API}/pullrequests/${PR}/comments")
     echo "[review365] $([ "$H" = 201 ] && echo ✓ || echo "~ (HTTP $H)") $SEV $URL"
@@ -391,8 +523,12 @@ echo "$FINDINGS" | jq -c '.[]' | while IFS= read -r f; do
       + (if .entry_point then "\n\n**Trigger:** "+.entry_point else "" end)
       + (if .impact then "\n**Impact:** "+.impact else "" end)
       + "\n\n_Posted by [review365](https://biz365.com.au)_")}]}')
+  if [ -n "$DRY_RUN" ]; then
+    H="dry-run"; echo "[review365] DRY RUN: would POST ${API}/pulls/${PR}/reviews"; echo "$PL" | jq . | sed 's/^/    /'
+  else
   H=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "Authorization: token ${API_TOKEN}" \
     -H "Content-Type: application/json" -d "$PL" "${API}/pulls/${PR}/reviews")
+  fi
   # Full URL: the log viewer can't resolve a bare path:line
   URL="${REPO_URL}/src/commit/${HEAD_SHA}/$(echo "$f" | jq -r '"\(.file)#L\(.line)"')"
   echo "[review365] $([ "$H" = 200 ] && echo ✓ || echo "~ (HTTP $H)") $SEV $URL"
@@ -406,7 +542,8 @@ if [ -n "$ON_BB" ]; then
   else
     STATE="SUCCESSFUL"; DESC="review365 (advisory): $(echo "$FINDINGS" | jq length) issue(s)"
   fi
-  [ -n "$BB_REVIEW_TOKEN" ] && curl -s -o /dev/null -X POST -H "Authorization: Bearer ${BB_REVIEW_TOKEN}" -H "Content-Type: application/json" \
+  [ -n "$DRY_RUN" ] && echo "[review365] DRY RUN: would set the review365 commit status"
+  [ -n "$BB_REVIEW_TOKEN" ] && [ -z "$DRY_RUN" ] && curl -s -o /dev/null -X POST -H "Authorization: Bearer ${BB_REVIEW_TOKEN}" -H "Content-Type: application/json" \
     -d "$(jq -n --arg s "$STATE" --arg d "$DESC" '{state:$s,key:"review365",name:"AI Code Review",description:$d}')" \
     "${BB_API}/commit/${HEAD_SHA}/statuses/build"
   echo "[review365] Status: ${STATE}"
