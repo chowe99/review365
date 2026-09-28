@@ -1,0 +1,46 @@
+name: review365 — AI Code Review (push)
+
+# review365 by Sam Wyndham (Biz365, https://biz365.com.au, https://github.com/mrwyndham).
+# Push mode (opt-in): reviews what each push to master changed (BEFORE..AFTER) and opens one
+# issue per push that has findings. Use it for repos that commit straight to master; keep
+# examples/gitea.yml for PRs. review365.sh skips new branches, lockfile-only pushes and
+# Gitea "Merge pull request" merge commits (already reviewed on the PR).
+# Secret: CLAUDE_CODE_OAUTH_TOKEN. The token must be able to create issues: github.token
+# or REVIEW365_TOKEN (a token with write:issue). Optional: the REVIEW365_NTFY_URL variable
+# (+ REVIEW365_NTFY_TOKEN secret) for a one-line alert per issue, and REVIEW365_SRC (a raw
+# URL, e.g. a branch) to try a review365 change on this repo first.
+
+on:
+  push:
+    branches: [master]
+
+env:
+  REVIEW365_FOCUS: "Next.js API, Postgres, Stripe"   # one line: what this repo is
+  # Optional: REVIEW365_CLASSES / REVIEW365_EXTRA_RULES (multi-line, `: |`), REVIEW365_NOISE
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    container: node:24-alpine
+    steps:
+      - name: AI Code Review
+        env:
+          REVIEW365_MODE: push
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          API_TOKEN: ${{ secrets.REVIEW365_TOKEN || github.token }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REPO_URL: ${{ github.event.repository.html_url }}
+          REVIEW365_NTFY_URL: ${{ vars.REVIEW365_NTFY_URL }}
+          REVIEW365_NTFY_TOKEN: ${{ secrets.REVIEW365_NTFY_TOKEN }}
+          REVIEW365_MODEL: ${{ vars.REVIEW365_MODEL }}
+          REVIEW365_VERIFY_MODEL: ${{ vars.REVIEW365_VERIFY_MODEL }}
+          REVIEW365_SRC: ${{ vars.REVIEW365_SRC }}
+          CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1"
+        shell: sh
+        run: |
+          # In-cluster URL: the job container can't always resolve git.howse.top.
+          apk add --no-cache curl >/dev/null
+          curl -fsSL --retry 3 --retry-all-errors -o /tmp/review365.sh \
+            "${REVIEW365_SRC:-${GITHUB_SERVER_URL}/cod/review365/raw/tag/v1/review365.sh}"
+          sh /tmp/review365.sh
