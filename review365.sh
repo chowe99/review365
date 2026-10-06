@@ -175,7 +175,12 @@ DEFAULT_CLASSES='- Authorization taken from client input: a user/admin/owner id,
       SameSite where they carry sessions, JWT/signature not verified, dev backdoors
       reachable in production.
     - Plain logic errors that give wrong results: inverted conditions, off-by-one, wrong
-      variable, missing await, race between check and write.'
+      variable, missing await, race between check and write.
+    - New polling where the source can push events: a loop, timer, cron or sleep-retry that
+      re-checks state the producer can announce (webhook, CI trigger on push/merge, inotify or
+      systemd .path unit, Kubernetes watch, Postgres LISTEN/NOTIFY, pub/sub, SSE/websocket).
+      Severity LOW; name the event source to use. Polling an external API that has no events
+      is fine.'
 
 # Trust assumptions shared by both passes (after anthropics/claude-code-security-review's
 # precedents). Deliberately NOT copied: its "crashes aren't vulns" and "integer overflow"
