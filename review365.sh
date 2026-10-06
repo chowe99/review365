@@ -121,6 +121,16 @@ echo "[review365] ${TARGET}, diff ${DIFF_SIZE} bytes"
 list_files() { grep -E '^diff --git ' "$1" | sed -E 's|^diff --git a/(.*) b/.*$|\1|' | sort -u; }
 ALL_FILES=$(list_files "$DIFF_FILE")
 
+# Docs-only changes: nothing to review. Deliberately narrow: only prose extensions (not .txt, which
+# would cover requirements.txt, and not a docs/ dir, where code could hide). Agent instruction files
+# are NOT docs: they steer AI tools (this review reads CLAUDE.md as context), so they always run.
+DOCS_ONLY='\.(md|mdx|rst|adoc)$'
+AGENT_FILES='(^|/)(CLAUDE|AGENTS)\.md$'
+if [ -n "$ALL_FILES" ] && ! echo "$ALL_FILES" | grep -qvE "$DOCS_ONLY" && ! echo "$ALL_FILES" | grep -qE "$AGENT_FILES"; then
+  echo "[review365] docs-only change ($(echo "$ALL_FILES" | tr '\n' ' ')). Skipping."
+  exit 0
+fi
+
 # Sanity cap only (2MB ≈ 500k tokens; the prompt goes via stdin, so no argv limit).
 # Cut at the last file boundary under the cap so no file is reviewed half-shown;
 # fall back to a raw byte cut if the first file alone exceeds it.
