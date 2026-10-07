@@ -6,10 +6,15 @@ name: review365 — AI Code Review
 # there, not here. Secret: CLAUDE_CODE_OAUTH_TOKEN. Open PRs from a pushed branch, because
 # Gitea gives AGit (refs/for/…) PRs no secrets. Set the REVIEW365_SRC variable to a raw URL
 # (e.g. a branch) to try a review365 change on this repo first.
+#
+# first-push: the push that creates the default branch (a new repo's first push) is reviewed
+# whole, with findings in one issue. Every later push is skipped by the job's `if`, so PRs do
+# the reviewing from then on.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  push:
 
 env:
   REVIEW365_FOCUS: "Next.js API, Postgres, Stripe"   # one line: what this repo is
@@ -17,6 +22,7 @@ env:
 
 jobs:
   review:
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     container: node:24-alpine
     steps:
@@ -35,6 +41,34 @@ jobs:
         shell: sh
         run: |
           # In-cluster URL: the job container can't always resolve git.howse.top.
+          apk add --no-cache curl >/dev/null
+          curl -fsSL --retry 3 --retry-all-errors -o /tmp/review365.sh \
+            "${REVIEW365_SRC:-${GITHUB_SERVER_URL}/cod/review365/raw/tag/v1/review365.sh}"
+          sh /tmp/review365.sh
+
+  first-push:
+    if: >-
+      github.event_name == 'push'
+      && github.event.before == '0000000000000000000000000000000000000000'
+      && github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    container: node:24-alpine
+    steps:
+      - name: AI Code Review (whole tree)
+        env:
+          REVIEW365_MODE: push
+          REVIEW365_FIRST_PUSH: "1"
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          API_TOKEN: ${{ secrets.REVIEW365_TOKEN || github.token }}
+          BEFORE: ${{ github.event.before }}
+          AFTER: ${{ github.sha }}
+          REPO_URL: ${{ github.event.repository.html_url }}
+          REVIEW365_MODEL: ${{ vars.REVIEW365_MODEL }}
+          REVIEW365_VERIFY_MODEL: ${{ vars.REVIEW365_VERIFY_MODEL }}
+          REVIEW365_SRC: ${{ vars.REVIEW365_SRC }}
+          CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1"
+        shell: sh
+        run: |
           apk add --no-cache curl >/dev/null
           curl -fsSL --retry 3 --retry-all-errors -o /tmp/review365.sh \
             "${REVIEW365_SRC:-${GITHUB_SERVER_URL}/cod/review365/raw/tag/v1/review365.sh}"

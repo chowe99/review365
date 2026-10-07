@@ -49,7 +49,14 @@ elif [ -n "$PUSH_MODE" ]; then
   # protocol v2), so a later push can't change what is reviewed; it becomes refs/pr, which is
   # what the review core reads files from.
   { [ -n "${BEFORE:-}" ] && [ -n "${AFTER:-}" ]; } || { echo "[review365] push mode needs BEFORE and AFTER"; exit 1; }
-  echo "$BEFORE" | grep -qE '^0+$' && { echo "[review365] push: new branch (BEFORE is all zeros), nothing to diff against. Skipping."; exit 0; }
+  # A push that creates a branch has BEFORE all zeros: nothing to diff against, so it's skipped.
+  # REVIEW365_FIRST_PUSH=1 (stubs set it only for the push that creates the default branch, i.e. a
+  # repo's first push) reviews the whole tree against the empty tree instead.
+  FIRST_PUSH=""
+  if echo "$BEFORE" | grep -qE '^0+$'; then
+    [ "${REVIEW365_FIRST_PUSH:-}" = 1 ] || { echo "[review365] push: new branch (BEFORE is all zeros), nothing to diff against. Skipping."; exit 0; }
+    FIRST_PUSH=1
+  fi
   echo "$AFTER" | grep -qE '^0+$' && { echo "[review365] push: branch deleted. Skipping."; exit 0; }
   HOST="${GITHUB_SERVER_URL#*://}"
   git init -q repo && cd repo || exit 1
@@ -58,10 +65,15 @@ elif [ -n "$PUSH_MODE" ]; then
     || { echo "[review365] fetch of AFTER ${AFTER} failed (token or SHA)"; exit 1; }
   # BEFORE is normally inside those 200 commits. Fetch it on its own when it isn't (a push of
   # more than 200 commits, or a force-push where BEFORE is no longer an ancestor).
-  git cat-file -e "${BEFORE}^{commit}" 2>/dev/null \
-    || git fetch -q --no-tags --depth=1 origin "$BEFORE" \
-    || { echo "[review365] fetch of BEFORE ${BEFORE} failed"; exit 1; }
-  BEFORE=$(git rev-parse "${BEFORE}^{commit}") && AFTER=$(git rev-parse refs/pr) || exit 1
+  if [ -n "$FIRST_PUSH" ]; then
+    BEFORE=4b825dc642cb6eb9a060e54bf8d69288fbee4904 # git's empty tree: every file reads as added
+    AFTER=$(git rev-parse refs/pr) || exit 1
+  else
+    git cat-file -e "${BEFORE}^{commit}" 2>/dev/null \
+      || git fetch -q --no-tags --depth=1 origin "$BEFORE" \
+      || { echo "[review365] fetch of BEFORE ${BEFORE} failed"; exit 1; }
+    BEFORE=$(git rev-parse "${BEFORE}^{commit}") && AFTER=$(git rev-parse refs/pr) || exit 1
+  fi
   # Merge of an already-reviewed PR (heuristic): Gitea's merge button pushes one merge commit
   # whose first parent is the old tip (BEFORE) and whose subject is Gitea's default
   # "Merge pull request '<title>' (#N) from <branch> into <base>". Its changes were reviewed
@@ -82,12 +94,16 @@ elif [ -n "$PUSH_MODE" ]; then
   fi
   SHORT_BEFORE=$(printf '%.7s' "$BEFORE"); SHORT_AFTER=$(printf '%.7s' "$AFTER")
   DIFF_RANGE="${BEFORE}..refs/pr"; LOG_RANGE="${BEFORE}..refs/pr"; CONTEXT_REF="$BEFORE"
+  # First push: the empty tree has no docs and no history, so docs come from the pushed tree and
+  # gitleaks scans every fetched commit.
+  [ -n "$FIRST_PUSH" ] && { LOG_RANGE="refs/pr"; CONTEXT_REF="refs/pr"; }
   # gitleaks reads a shallow boundary commit as adding its whole tree, which floods the report
   # with old secrets when BEFORE was outside the 200 commits. Exclude the boundaries: a push of
   # more than 200 commits gets its newest 200 scanned. (Single spaces: gitleaks splits on them.)
   SHALLOW="$(git rev-parse --git-dir)/shallow"
   [ -f "$SHALLOW" ] && while IFS= read -r c; do LOG_RANGE="${LOG_RANGE} ^${c}"; done < "$SHALLOW"
   TARGET="push ${SHORT_BEFORE}..${SHORT_AFTER} (${GITHUB_REF_NAME:-branch})"
+  [ -n "$FIRST_PUSH" ] && TARGET="first push: whole tree at ${SHORT_AFTER} (${GITHUB_REF_NAME:-branch})"
   # BASE is only a label from here on ("PROJECT CONTEXT (from …)"): docs come from BEFORE.
   BASE="${GITHUB_REF_NAME:-branch}@${SHORT_BEFORE}"; HEAD_SHA="$AFTER"; PR=""; LEAKS=""
 else
@@ -460,7 +476,9 @@ else
     | "- \($e) **\(.severity)** [`\(.file):\(.line)`](\($u)/\(.file)#L\(.line)): \(.message)"
       + (if .entry_point then "\n  **Trigger:** \(.entry_point)" else "" end)
       + (if .impact then "\n  **Impact:** \(.impact)" else "" end)')
-  BODY="Push [\`${SHORT_BEFORE}..${SHORT_AFTER}\`](${REPO_URL}/compare/${BEFORE}...${AFTER}) to \`${GITHUB_REF_NAME:-branch}\`.
+  if [ -n "$FIRST_PUSH" ]; then SCOPE="First push to \`${GITHUB_REF_NAME:-branch}\`: the whole tree at [\`${SHORT_AFTER}\`](${COMMIT_URL})"; GL_NOTE=$(echo "$GL_NOTE" | sed "s/the commits in ${SHORT_BEFORE}\.\.${SHORT_AFTER}/every pushed commit (up to 200)/")
+  else SCOPE="Push [\`${SHORT_BEFORE}..${SHORT_AFTER}\`](${REPO_URL}/compare/${BEFORE}...${AFTER}) to \`${GITHUB_REF_NAME:-branch}\`"; fi
+  BODY="${SCOPE}.
 
 ## Findings
 
