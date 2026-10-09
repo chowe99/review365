@@ -310,7 +310,14 @@ PROMPT_FILE=$(mktemp)
 if [ -n "$DRY_RUN" ] && command -v claude >/dev/null 2>&1; then
   echo "[review365] dry run: using the installed $(command -v claude)"
 else
-curl -fsSL --retry 3 --retry-all-errors https://claude.ai/install.sh | bash >/dev/null
+  # Retried, and loud on failure: a flaky download once left only "claude: not found" in the log.
+  for try in 1 2 3; do
+    curl -fsSL --retry 3 --retry-all-errors https://claude.ai/install.sh | bash > /tmp/claude-install.log 2>&1 \
+      && [ -x "$HOME/.local/bin/claude" ] && break
+    echo "[review365] claude install attempt $try failed:"; tail -5 /tmp/claude-install.log | sed 's/^/  /'
+    [ "$try" = 3 ] && { echo "[review365] could not install claude; no review performed"; exit 1; }
+    sleep 10
+  done
 fi
 export PATH="$HOME/.local/bin:$HOME/.claude/bin:$PATH"
 
