@@ -9,15 +9,20 @@ This repo is CodeRed's port of his Bitbucket Pipelines step to Gitea, plus later
 
 1. The PR diff goes to Claude together with the base branch's `CLAUDE.md`, `AGENTS.md` and
    `README.md`. Lockfiles, SVGs, minified JS, source maps and Unreal binary assets are left out.
-2. Each finding must describe its attack: the attacker, the entry point, the path from source
+   The author's claims go with it: the commit messages and, in PR mode, the PR title and
+   description (10KB each, treated as data).
+2. Besides bugs, a claim the code doesn't keep is a finding: the PR or a new comment promises a
+   fallback, a limit or a handled case, and the code doesn't deliver it. Wording and testing
+   claims are not findings.
+3. Each finding must describe its attack: the attacker, the entry point, the path from source
    to sink, and the impact. Code, not the model, drops any finding that:
    - has no entry point
    - needs privileged access
    - scores under 0.8 confidence
    - uses excluded "noise" wording
-3. A second, skeptical pass on Opus re-judges each surviving finding against the full files.
-4. gitleaks (pinned, checksummed, offline) scans the PR's commits for secrets.
-5. Each finding is posted as an inline PR comment.
+4. A second, skeptical pass on Opus re-judges each surviving finding against the full files.
+5. gitleaks (pinned, checksummed, offline) scans the PR's commits for secrets.
+6. Each finding is posted as an inline PR comment.
 
 ## Using it
 
