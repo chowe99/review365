@@ -28,11 +28,12 @@ This repo is CodeRed's port of his Bitbucket Pipelines step to Gitea, plus later
 
 Every repo runs `review365.sh` at the **moving tag `v1`**. A repo's workflow is only a stub
 with its trigger and settings: `examples/gitea.yml` for Gitea, and
-`examples/bitbucket-step.yml` (kindnote's) for Bitbucket. To ship a change to every repo:
+`examples/bitbucket-step.yml` (kindnote's) for Bitbucket. **Merging to master ships a change
+to every repo:** `.gitea/workflows/release.yml` checks that the script parses, then moves `v1`
+to the merged commit. By hand, if the action is down:
 
 ```sh
-git commit -am "…" && git push
-git tag -f v1 && git push -f origin v1
+git tag -f v1 origin/master && git push -f origin v1
 ```
 
 To test a change on one repo first, point that repo's stub at a branch or commit via

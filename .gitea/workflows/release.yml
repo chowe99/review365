@@ -1,0 +1,28 @@
+# Merging to master ships review365: every repo's stub fetches review365.sh at the moving tag v1,
+# so this moves v1 to the merged commit. To try a change on one repo first, use REVIEW365_SRC.
+name: release
+
+on:
+  push:
+    branches: [master]
+
+jobs:
+  move-v1:
+    runs-on: ubuntu-latest
+    container: alpine:3
+    steps:
+      - name: Move v1 to this commit
+        env:
+          TOKEN: ${{ github.token }}
+        shell: sh
+        run: |
+          apk add --no-cache git >/dev/null
+          REMOTE="${GITHUB_SERVER_URL%%://*}://x-access-token:${TOKEN}@${GITHUB_SERVER_URL#*://}/${GITHUB_REPOSITORY}.git"
+          git clone -q "$REMOTE" r && cd r && git checkout -q "$GITHUB_SHA"
+          # A script that doesn't parse would break the review in every repo at once.
+          sh -n review365.sh
+          # Two quick merges: only the newest moves v1, so an older run can't move it back.
+          [ "$(git ls-remote origin refs/heads/master | cut -f1)" = "$GITHUB_SHA" ] \
+            || { echo "master moved past ${GITHUB_SHA}; its own run moves v1"; exit 0; }
+          git push -f origin "${GITHUB_SHA}:refs/tags/v1"
+          echo "v1 -> ${GITHUB_SHA}"
